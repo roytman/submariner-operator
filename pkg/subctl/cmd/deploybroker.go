@@ -18,6 +18,7 @@ package cmd
 
 import (
 	"fmt"
+	"net"
 
 	"github.com/spf13/cobra"
 
@@ -34,6 +35,9 @@ var (
 	serviceDiscovery             bool
 	serviceDiscoveryImageRepo    string
 	serviceDiscoveryImageVersion string
+	globalnetEnable              bool
+	globalnetCidrRange           string
+	globalnetClusterSize         uint8
 )
 
 func init() {
@@ -42,6 +46,13 @@ func init() {
 	deployBroker.PersistentFlags().BoolVar(&disableDataplane, "no-dataplane", true,
 		"Don't install the Submariner dataplane on the broker (default)")
 	lighthouse.AddFlags(deployBroker, "service-discovery")
+
+	deployBroker.PersistentFlags().BoolVar(&globalnetEnable, "globalnet-enable", false,
+		"Enable support for Overlapping CIDRs in connecting clusters")
+	deployBroker.PersistentFlags().StringVar(&globalnetCidrRange, "globalnet-cidr-range", "169.254.0.0/16",
+		"Global CIDR supernet range for allocating GlobalCIDRs to each cluster")
+	deployBroker.PersistentFlags().Uint8Var(&globalnetClusterSize, "globalnet-cluster-size", 8,
+		"Default prefix size for GlobalCIDR allocated to each cluster")
 	err := deployBroker.PersistentFlags().MarkHidden("no-dataplane")
 	// An error here indicates a programming error (the argument isn’t declared), panic
 	panicOnError(err)
@@ -60,14 +71,18 @@ var deployBroker = &cobra.Command{
 	Use:   "deploy-broker",
 	Short: "set the broker up",
 	Run: func(cmd *cobra.Command, args []string) {
+
 		config, err := getRestConfig(kubeConfig, kubeContext)
 		exitOnError("The provided kubeconfig is invalid", err)
+
+		if valid, err := isValidGlobalnetConfig(); !valid {
+			exitOnError("Invalid GlobalCidr configuration", err)
+		}
 
 		err = lighthouse.Validate()
 		exitOnError("Invalid configuration", err)
 
 		status := cli.NewStatus()
-
 		status.Start("Deploying broker")
 		err = broker.Ensure(config)
 		status.End(err == nil)
@@ -96,6 +111,10 @@ var deployBroker = &cobra.Command{
 		}
 
 		subctlData.ServiceDiscovery = serviceDiscovery
+		if globalnetEnable {
+			subctlData.GlobalnetCidrRange = globalnetCidrRange
+			subctlData.GlobalnetClusterSize = int(globalnetClusterSize)
+		}
 
 		err = subctlData.WriteToFile(brokerDetailsFilename)
 		status.End(err == nil)
@@ -112,4 +131,20 @@ var deployBroker = &cobra.Command{
 			joinSubmarinerCluster(config, subctlData)
 		}
 	},
+}
+
+func isValidGlobalnetConfig() (bool, error) {
+	if !globalnetEnable {
+		return true, nil
+	}
+	_, network, err := net.ParseCIDR(globalnetCidrRange)
+	if err != nil {
+		return false, err
+	}
+	ones, totalbits := network.Mask.Size()
+	availableSize := uint8(totalbits - ones)
+	if globalnetClusterSize >= availableSize {
+		return false, fmt.Errorf("Cluster size %d should be less than %d", globalnetClusterSize, availableSize)
+	}
+	return true, nil
 }
